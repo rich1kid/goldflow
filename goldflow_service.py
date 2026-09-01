@@ -37,7 +37,6 @@ import asyncio
 import os
 import logging
 from collections import deque
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from metaapi_cloud_sdk import MetaApi, SynchronizationListener
@@ -64,32 +63,6 @@ def parse_broker_time(ts: str) -> datetime:
     if ts.endswith("Z"):
         ts = ts[:-1] + "+00:00"
     return datetime.fromisoformat(ts)
-
-
-@dataclass
-class Candle:
-    time: str
-    open: float
-    high: float
-    low: float
-    close: float
-    tick_volume: int
-
-
-class VolumeWindow:
-    """Rolling window of completed candles, used only to establish a
-    baseline average volume-per-candle for a given timeframe."""
-
-    def __init__(self, maxlen: int = 50):
-        self.candles = deque(maxlen=maxlen)
-
-    def add(self, c: Candle):
-        self.candles.append(c)
-
-    def avg_volume(self) -> float:
-        if len(self.candles) < 5:
-            return 0.0
-        return sum(c.tick_volume for c in self.candles) / len(self.candles)
 
 
 class RiskManager:
@@ -128,17 +101,28 @@ class RiskManager:
 
 class PartialCandleTracker:
     """Tracks the candle currently forming for one timeframe, tick by
-    tick, so we can act in its final 25% without waiting for it to close."""
+    tick, so we can act in its final 25% without waiting for it to close.
 
-    def __init__(self, label: str, timeframe_seconds: int, volume_window: VolumeWindow):
+    The volume baseline is built from this tracker's OWN completed tick
+    counts (not MetaAPI's candle stream), since MetaAPI sends repeated
+    "intermediate" updates for the still-forming candle — using those
+    directly would contaminate the baseline with a constantly-rising
+    partial count instead of clean historical data."""
+
+    def __init__(self, label: str, timeframe_seconds: int, history_len: int = 50):
         self.label = label
         self.timeframe_seconds = timeframe_seconds
         self.entry_window_seconds = timeframe_seconds * 0.25  # last 25% of the candle
-        self.volume_window = volume_window
+        self.history = deque(maxlen=history_len)
         self.candle_start_epoch = None
         self.open_price = None
         self.tick_count = 0
         self.entered_this_candle = False
+
+    def _avg_history_volume(self) -> float:
+        if len(self.history) < 5:
+            return 0.0
+        return sum(self.history) / len(self.history)
 
     def on_tick(self, price: float, ts: datetime):
         """Returns (seconds_remaining, should_consider_entry: bool)."""
@@ -146,6 +130,8 @@ class PartialCandleTracker:
         start_epoch = (epoch // self.timeframe_seconds) * self.timeframe_seconds
 
         if self.candle_start_epoch != start_epoch:
+            if self.candle_start_epoch is not None:
+                self.history.append(self.tick_count)
             self.candle_start_epoch = start_epoch
             self.open_price = price
             self.tick_count = 0
@@ -158,7 +144,7 @@ class PartialCandleTracker:
         if self.entered_this_candle or remaining > self.entry_window_seconds:
             return remaining, False
 
-        avg_volume = self.volume_window.avg_volume()
+        avg_volume = self._avg_history_volume()
         if avg_volume == 0:
             return remaining, False
 
@@ -259,10 +245,8 @@ async def main():
     await connection.connect()
     await connection.wait_synchronized()
 
-    m1_window = VolumeWindow(maxlen=50)
-    h1_window = VolumeWindow(maxlen=50)
-    m1_tracker = PartialCandleTracker("M1", 60, m1_window)
-    h1_tracker = PartialCandleTracker("H1", 3600, h1_window)
+    m1_tracker = PartialCandleTracker("M1", 60)
+    h1_tracker = PartialCandleTracker("H1", 3600)
     risk_manager = RiskManager(max_daily_loss_usd=MAX_DAILY_LOSS_USD)
 
     try:
@@ -273,29 +257,6 @@ async def main():
         pass
 
     class MainListener(SynchronizationListener):
-        async def on_candles_updated(self, instance_index, candles, equity=None, margin=None,
-                                       free_margin=None, margin_level=None,
-                                       account_currency_exchange_rate=None):
-            if equity is not None:
-                risk_manager.update_equity(equity)
-
-            for raw in candles:
-                if raw.get("symbol") != SYMBOL:
-                    continue
-                c = Candle(
-                    time=raw["time"],
-                    open=raw["open"],
-                    high=raw["high"],
-                    low=raw["low"],
-                    close=raw["close"],
-                    tick_volume=raw.get("tickVolume", 0),
-                )
-                tf = raw.get("timeframe")
-                if tf == "1m":
-                    m1_window.add(c)
-                elif tf == "1h":
-                    h1_window.add(c)
-
         async def on_symbol_price_updated(self, instance_index, price):
             if price.get("symbol") != SYMBOL:
                 return
