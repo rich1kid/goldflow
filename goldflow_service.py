@@ -17,7 +17,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass
 from dotenv import load_dotenv
-from metaapi_cloud_sdk import MetaApi
+from metaapi_cloud_sdk import MetaApi, SynchronizationListener
 
 load_dotenv()
 
@@ -115,7 +115,7 @@ async def main():
 
     window = VolumeWindow(maxlen=50)
 
-    class CandleListener:
+    class CandleListener(SynchronizationListener):
         async def on_candles_updated(self, candles):
             for raw in candles:
                 if raw.get("symbol") != SYMBOL:
