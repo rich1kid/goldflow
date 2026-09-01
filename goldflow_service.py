@@ -1,25 +1,35 @@
 """
 goldflow_service.py
 
-Signal + risk-managed execution service for the XAU/USD signal engine.
+Late-candle momentum scalper for XAU/USD.
+
+Strategy (as specified):
+  For both the M1 and H1 timeframes, watch the candle currently forming.
+  In the final 25% of that candle's duration (last 15s of an M1 candle,
+  last 15min of an H1 candle), if volume-so-far is unusually high for
+  how much of the candle has elapsed, enter in the direction of the
+  trend so far (price above/below that candle's open) and close the
+  position automatically right when the candle closes.
 
 Runs on: Oracle Cloud VPS (systemd service: goldflow.service)
 Talks to: MT5 account via MetaAPI (streaming quotes + trade execution)
 
-NOTE: MetaAPI/MT5 gives the broker's own tick volume for XAU/USD, not a
-real Depth-of-Market like COMEX GC futures has. So the "absorption"
-detector below is an approximation from tick-volume spikes + candle
-rejection wicks, not the real institutional order book.
+NOTE: MetaAPI/MT5 gives the broker's own tick volume, not real
+Depth-of-Market. "Volume-so-far" here is approximated by counting price
+ticks received during the forming candle and comparing to what a
+proportional share of the timeframe's average completed-candle volume
+would predict. It is a heuristic, not real order-book data.
 
 Env vars (.env, never committed):
     METAAPI_TOKEN=your_metaapi_token
     METAAPI_ACCOUNT_ID=your_mt5_account_id_in_metaapi
     SYMBOL=XAUUSD
-    RISK_PER_TRADE_USD=10
     LOT_SIZE=0.01
-    SL_DISTANCE_USD=3.0
-    TP_DISTANCE_USD=6.0
+    EMERGENCY_SL_DISTANCE_USD=5.0
+    SCALP_VOLUME_MULTIPLIER=1.5
     MAX_DAILY_LOSS_USD=20.0
+    SCALP_M1_ENABLED=true
+    SCALP_H1_ENABLED=true
     DRY_RUN=true
 """
 
@@ -40,12 +50,20 @@ log = logging.getLogger("goldflow")
 METAAPI_TOKEN = os.environ["METAAPI_TOKEN"]
 ACCOUNT_ID = os.environ["METAAPI_ACCOUNT_ID"]
 SYMBOL = os.environ.get("SYMBOL", "XAUUSD")
-RISK_USD = float(os.environ.get("RISK_PER_TRADE_USD", "10"))
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 LOT_SIZE = float(os.environ.get("LOT_SIZE", "0.01"))
-SL_DISTANCE = float(os.environ.get("SL_DISTANCE_USD", "3.0"))
-TP_DISTANCE = float(os.environ.get("TP_DISTANCE_USD", "6.0"))
+EMERGENCY_SL_DISTANCE = float(os.environ.get("EMERGENCY_SL_DISTANCE_USD", "5.0"))
+SCALP_VOLUME_MULTIPLIER = float(os.environ.get("SCALP_VOLUME_MULTIPLIER", "1.5"))
 MAX_DAILY_LOSS_USD = float(os.environ.get("MAX_DAILY_LOSS_USD", "20.0"))
+SCALP_M1_ENABLED = os.environ.get("SCALP_M1_ENABLED", "true").lower() == "true"
+SCALP_H1_ENABLED = os.environ.get("SCALP_H1_ENABLED", "true").lower() == "true"
+
+
+def parse_broker_time(ts: str) -> datetime:
+    """Parses MetaAPI's ISO8601 broker/eventGenerated timestamps."""
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    return datetime.fromisoformat(ts)
 
 
 @dataclass
@@ -59,7 +77,8 @@ class Candle:
 
 
 class VolumeWindow:
-    """Rolling window used to spot abnormal tick-volume vs recent average."""
+    """Rolling window of completed candles, used only to establish a
+    baseline average volume-per-candle for a given timeframe."""
 
     def __init__(self, maxlen: int = 50):
         self.candles = deque(maxlen=maxlen)
@@ -71,9 +90,6 @@ class VolumeWindow:
         if len(self.candles) < 5:
             return 0.0
         return sum(c.tick_volume for c in self.candles) / len(self.candles)
-
-    def latest(self):
-        return self.candles[-1] if self.candles else None
 
 
 class RiskManager:
@@ -110,75 +126,124 @@ class RiskManager:
         return not self.trading_halted
 
 
-def calculate_sl_tp(entry_price: float, side: str):
-    """Returns (stop_loss, take_profit) price levels for a given side."""
-    if side == "buy":
-        sl = entry_price - SL_DISTANCE
-        tp = entry_price + TP_DISTANCE
-    else:
-        sl = entry_price + SL_DISTANCE
-        tp = entry_price - TP_DISTANCE
-    return round(sl, 2), round(tp, 2)
+class PartialCandleTracker:
+    """Tracks the candle currently forming for one timeframe, tick by
+    tick, so we can act in its final 25% without waiting for it to close."""
 
+    def __init__(self, label: str, timeframe_seconds: int, volume_window: VolumeWindow):
+        self.label = label
+        self.timeframe_seconds = timeframe_seconds
+        self.entry_window_seconds = timeframe_seconds * 0.25  # last 25% of the candle
+        self.volume_window = volume_window
+        self.candle_start_epoch = None
+        self.open_price = None
+        self.tick_count = 0
+        self.entered_this_candle = False
 
-def get_signal(window: VolumeWindow):
-    """
-    Returns 'buy', 'sell', or None.
+    def on_tick(self, price: float, ts: datetime):
+        """Returns (seconds_remaining, should_consider_entry: bool)."""
+        epoch = ts.timestamp()
+        start_epoch = (epoch // self.timeframe_seconds) * self.timeframe_seconds
 
-    Current logic (approximation): tick volume on the latest candle is a
-    big multiple of the rolling average AND the candle shows rejection
-    (long wick) rather than a clean breakout.
-    """
-    c = window.latest()
-    avg = window.avg_volume()
-    if c is None or avg == 0:
-        return None
+        if self.candle_start_epoch != start_epoch:
+            self.candle_start_epoch = start_epoch
+            self.open_price = price
+            self.tick_count = 0
+            self.entered_this_candle = False
 
-    is_big_print = c.tick_volume > avg * 2.5
-    body = abs(c.close - c.open)
-    full_range = c.high - c.low
-    if full_range == 0:
-        return None
-    wick_ratio = 1 - (body / full_range)
+        self.tick_count += 1
+        elapsed = epoch - start_epoch
+        remaining = self.timeframe_seconds - elapsed
 
-    if is_big_print and wick_ratio > 0.6:
-        upper_wick = c.high - max(c.open, c.close)
-        lower_wick = min(c.open, c.close) - c.low
-        if upper_wick > lower_wick:
-            return "sell"
-        else:
+        if self.entered_this_candle or remaining > self.entry_window_seconds:
+            return remaining, False
+
+        avg_volume = self.volume_window.avg_volume()
+        if avg_volume == 0:
+            return remaining, False
+
+        elapsed_fraction = elapsed / self.timeframe_seconds
+        expected_ticks_so_far = elapsed_fraction * avg_volume
+
+        if self.tick_count > expected_ticks_so_far * SCALP_VOLUME_MULTIPLIER:
+            return remaining, True
+
+        return remaining, False
+
+    def trend_direction(self, current_price: float):
+        if self.open_price is None:
+            return None
+        if current_price > self.open_price:
             return "buy"
-    return None
+        elif current_price < self.open_price:
+            return "sell"
+        return None
+
+    def candle_close_epoch(self) -> float:
+        return self.candle_start_epoch + self.timeframe_seconds
+
+    def mark_entered(self):
+        self.entered_this_candle = True
 
 
-async def place_trade(connection, side: str, entry_price: float, risk_manager: RiskManager):
+async def close_position_later(connection, position_id: str, delay_seconds: float, label: str):
+    """Waits until the candle closes, then flattens the scalp position."""
+    if delay_seconds > 0:
+        await asyncio.sleep(delay_seconds)
+    if DRY_RUN:
+        log.info(f"[DRY_RUN] Would close {label} scalp position {position_id} now (candle closed)")
+        return
+    try:
+        result = await connection.close_position(position_id, {"comment": "goldflow-scalp-exit"})
+        log.info(f"Closed {label} scalp position {position_id}: {result}")
+    except Exception as e:
+        log.error(f"Failed to close {label} scalp position {position_id}: {e}")
+
+
+async def enter_scalp(connection, tracker: PartialCandleTracker, side: str,
+                       current_price: float, risk_manager: RiskManager):
     if not risk_manager.can_trade():
-        log.warning(f"Signal fired ({side.upper()}) but trading is halted for today. Skipping.")
+        log.warning(f"{tracker.label} scalp signal ({side.upper()}) but trading is halted today. Skipping.")
         return
 
-    sl, tp = calculate_sl_tp(entry_price, side)
+    tracker.mark_entered()
+    seconds_until_close = max(tracker.candle_close_epoch() - datetime.now(timezone.utc).timestamp(), 0)
+
+    if side == "buy":
+        emergency_sl = round(current_price - EMERGENCY_SL_DISTANCE, 2)
+    else:
+        emergency_sl = round(current_price + EMERGENCY_SL_DISTANCE, 2)
 
     if DRY_RUN:
         log.info(
-            f"[DRY_RUN] Would place {side.upper()} on {SYMBOL} at ~{entry_price} "
-            f"| SL={sl} TP={tp} | lot={LOT_SIZE}"
+            f"[DRY_RUN] {tracker.label} scalp: would {side.upper()} at ~{current_price} "
+            f"(emergency SL={emergency_sl}, lot={LOT_SIZE}), "
+            f"would auto-close in {seconds_until_close:.1f}s"
         )
+        asyncio.create_task(close_position_later(connection, "dry-run", seconds_until_close, tracker.label))
         return
 
     try:
         if side == "buy":
             result = await connection.create_market_buy_order(
-                SYMBOL, volume=LOT_SIZE, stop_loss=sl, take_profit=tp,
-                options={"comment": "goldflow-signal"}
+                SYMBOL, volume=LOT_SIZE, stop_loss=emergency_sl, take_profit=None,
+                options={"comment": f"goldflow-scalp-{tracker.label}"}
             )
         else:
             result = await connection.create_market_sell_order(
-                SYMBOL, volume=LOT_SIZE, stop_loss=sl, take_profit=tp,
-                options={"comment": "goldflow-signal"}
+                SYMBOL, volume=LOT_SIZE, stop_loss=emergency_sl, take_profit=None,
+                options={"comment": f"goldflow-scalp-{tracker.label}"}
             )
-        log.info(f"Order placed: {side.upper()} SL={sl} TP={tp} | Result: {result}")
+        log.info(f"{tracker.label} scalp opened: {side.upper()} emergency_SL={emergency_sl} | Result: {result}")
+
+        position_id = result.get("positionId") if isinstance(result, dict) else None
+        if position_id:
+            asyncio.create_task(close_position_later(connection, position_id, seconds_until_close, tracker.label))
+        else:
+            log.warning(f"No positionId returned for {tracker.label} scalp — cannot schedule auto-close. "
+                        f"Emergency SL is still in place as a safety net.")
     except Exception as e:
-        log.error(f"Trade execution failed: {e}")
+        log.error(f"{tracker.label} scalp order failed: {e}")
 
 
 async def main():
@@ -194,7 +259,10 @@ async def main():
     await connection.connect()
     await connection.wait_synchronized()
 
-    window = VolumeWindow(maxlen=50)
+    m1_window = VolumeWindow(maxlen=50)
+    h1_window = VolumeWindow(maxlen=50)
+    m1_tracker = PartialCandleTracker("M1", 60, m1_window)
+    h1_tracker = PartialCandleTracker("H1", 3600, h1_window)
     risk_manager = RiskManager(max_daily_loss_usd=MAX_DAILY_LOSS_USD)
 
     try:
@@ -222,11 +290,37 @@ async def main():
                     close=raw["close"],
                     tick_volume=raw.get("tickVolume", 0),
                 )
-                window.add(c)
-                signal = get_signal(window)
-                if signal:
-                    log.info(f"Signal fired: {signal.upper()} at {c.close}")
-                    await place_trade(connection, signal, c.close, risk_manager)
+                tf = raw.get("timeframe")
+                if tf == "1m":
+                    m1_window.add(c)
+                elif tf == "1h":
+                    h1_window.add(c)
+
+        async def on_symbol_price_updated(self, instance_index, price):
+            if price.get("symbol") != SYMBOL:
+                return
+            bid = price.get("bid")
+            ask = price.get("ask")
+            if bid is None or ask is None:
+                return
+            mid = (bid + ask) / 2
+            ts = parse_broker_time(price["time"])
+
+            if SCALP_M1_ENABLED:
+                remaining, should_check = m1_tracker.on_tick(mid, ts)
+                if should_check:
+                    direction = m1_tracker.trend_direction(mid)
+                    if direction:
+                        log.info(f"M1 scalp signal: {direction.upper()} at {mid} ({remaining:.1f}s left in candle)")
+                        await enter_scalp(connection, m1_tracker, direction, mid, risk_manager)
+
+            if SCALP_H1_ENABLED:
+                remaining, should_check = h1_tracker.on_tick(mid, ts)
+                if should_check:
+                    direction = h1_tracker.trend_direction(mid)
+                    if direction:
+                        log.info(f"H1 scalp signal: {direction.upper()} at {mid} ({remaining/60:.1f}min left in candle)")
+                        await enter_scalp(connection, h1_tracker, direction, mid, risk_manager)
 
         async def on_account_information_updated(self, instance_index, account_information):
             equity = account_information.get("equity")
@@ -234,12 +328,14 @@ async def main():
                 risk_manager.update_equity(equity)
 
     connection.add_synchronization_listener(MainListener())
-    await connection.subscribe_to_market_data(SYMBOL, [{"type": "candles", "timeframe": "1m"}])
+    await connection.subscribe_to_market_data(
+        SYMBOL, [{"type": "candles", "timeframe": "1m"}, {"type": "candles", "timeframe": "1h"}]
+    )
 
     log.info(
-        f"goldflow_service running on {SYMBOL}, DRY_RUN={DRY_RUN}, "
-        f"lot={LOT_SIZE}, SL=${SL_DISTANCE}, TP=${TP_DISTANCE}, "
-        f"max_daily_loss=${MAX_DAILY_LOSS_USD}"
+        f"goldflow scalper running on {SYMBOL}, DRY_RUN={DRY_RUN}, lot={LOT_SIZE}, "
+        f"M1_enabled={SCALP_M1_ENABLED}, H1_enabled={SCALP_H1_ENABLED}, "
+        f"emergency_SL=${EMERGENCY_SL_DISTANCE}, max_daily_loss=${MAX_DAILY_LOSS_USD}"
     )
     while True:
         await asyncio.sleep(60)
