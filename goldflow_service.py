@@ -2,13 +2,14 @@
 goldflow_service.py
 
 Skeleton service for Jeff's Bot / Korrington's XAU/USD signal engine.
+
 Runs on: Oracle Cloud free-tier VM
 Talks to: MT5 account via MetaAPI (streaming quotes + trade execution)
 
 NOTE: MetaAPI/MT5 gives the broker's own tick volume for XAU/USD, not a
-real Depth-of-Market like COMEX GC futures. So the "absorption" detector
-below is an approximation from tick-volume spikes + candle rejection
-wicks, not the real institutional order book.
+real Depth-of-Market / order book like COMEX GC futures has. So the
+"absorption" detector below is an approximation from tick-volume spikes +
+candle rejection wicks, not the real institutional order book.
 """
 
 import asyncio
@@ -116,7 +117,9 @@ async def main():
     window = VolumeWindow(maxlen=50)
 
     class CandleListener(SynchronizationListener):
-        async def on_candles_updated(self, candles):
+        async def on_candles_updated(self, instance_index, candles, equity=None, margin=None,
+                                       free_margin=None, margin_level=None,
+                                       account_currency_exchange_rate=None):
             for raw in candles:
                 if raw.get("symbol") != SYMBOL:
                     continue
