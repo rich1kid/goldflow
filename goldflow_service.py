@@ -105,9 +105,7 @@ class PartialCandleTracker:
 
     The volume baseline is built from this tracker's OWN completed tick
     counts (not MetaAPI's candle stream), since MetaAPI sends repeated
-    "intermediate" updates for the still-forming candle — using those
-    directly would contaminate the baseline with a constantly-rising
-    partial count instead of clean historical data."""
+    "intermediate" updates for the still-forming candle."""
 
     def __init__(self, label: str, timeframe_seconds: int, history_len: int = 50):
         self.label = label
@@ -118,6 +116,8 @@ class PartialCandleTracker:
         self.open_price = None
         self.tick_count = 0
         self.entered_this_candle = False
+        self.window_start_ticks = None
+        self.window_start_epoch = None
 
     def _avg_history_volume(self) -> float:
         if len(self.history) < 5:
@@ -136,22 +136,35 @@ class PartialCandleTracker:
             self.open_price = price
             self.tick_count = 0
             self.entered_this_candle = False
+            self.window_start_ticks = None
+            self.window_start_epoch = None
 
         self.tick_count += 1
         elapsed = epoch - start_epoch
         remaining = self.timeframe_seconds - elapsed
 
+        # Mark the moment we cross into the final 25% of the candle, so we
+        # can measure volume RATE from that point forward only.
+        if remaining <= self.entry_window_seconds and self.window_start_ticks is None:
+            self.window_start_ticks = self.tick_count - 1
+            self.window_start_epoch = epoch
+
         if self.entered_this_candle or remaining > self.entry_window_seconds:
             return remaining, False
 
         avg_volume = self._avg_history_volume()
-        if avg_volume == 0:
+        if avg_volume == 0 or self.window_start_ticks is None:
             return remaining, False
 
-        elapsed_fraction = elapsed / self.timeframe_seconds
-        expected_ticks_so_far = elapsed_fraction * avg_volume
+        window_ticks = self.tick_count - self.window_start_ticks
+        window_elapsed = epoch - self.window_start_epoch
+        if window_elapsed <= 0 or window_ticks < 3:
+            return remaining, False
 
-        if self.tick_count > expected_ticks_so_far * SCALP_VOLUME_MULTIPLIER:
+        expected_rate_per_sec = avg_volume / self.timeframe_seconds
+        expected_window_ticks = expected_rate_per_sec * window_elapsed
+
+        if expected_window_ticks > 0 and window_ticks > expected_window_ticks * SCALP_VOLUME_MULTIPLIER:
             return remaining, True
 
         return remaining, False
