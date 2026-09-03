@@ -2,15 +2,8 @@
 goldflow_service.py
 
 Late-candle momentum scalper + basic 3-candle pattern confirmation, for XAU/USD.
-
-Strategies:
-  1. Scalp (M1/H1): watch the candle currently forming. In its final 25%,
-     if volume-so-far is unusually high, enter in the direction of the
-     trend so far and close automatically when the candle closes.
-  2. Pattern (M1): three consecutive same-direction completed candles
-     with rising/falling closes (a simplified three-soldiers/three-crows
-     check) — fires far more often, used to confirm the execution
-     pipeline actually places trades.
+Also includes an optional one-shot no-logic TEST TRADE to confirm the
+execution pipeline works, independent of any signal detection.
 
 Runs on: Oracle Cloud VPS (systemd service: goldflow.service)
 Talks to: MT5 account via MetaAPI (streaming quotes + trade execution)
@@ -28,6 +21,7 @@ Env vars (.env, never committed):
     PATTERN_STRATEGY_ENABLED=true
     PATTERN_SL_DISTANCE_USD=3.0
     PATTERN_TP_DISTANCE_USD=6.0
+    TEST_TRADE_ENABLED=false
     DRY_RUN=true
 """
 
@@ -57,6 +51,7 @@ SCALP_H1_ENABLED = os.environ.get("SCALP_H1_ENABLED", "true").lower() == "true"
 PATTERN_STRATEGY_ENABLED = os.environ.get("PATTERN_STRATEGY_ENABLED", "true").lower() == "true"
 PATTERN_SL_DISTANCE = float(os.environ.get("PATTERN_SL_DISTANCE_USD", "3.0"))
 PATTERN_TP_DISTANCE = float(os.environ.get("PATTERN_TP_DISTANCE_USD", "6.0"))
+TEST_TRADE_ENABLED = os.environ.get("TEST_TRADE_ENABLED", "false").lower() == "true"
 
 
 def parse_broker_time(ts: str) -> datetime:
@@ -189,6 +184,8 @@ class CandlePatternTracker:
 
         if self.candle_start_epoch != start_epoch:
             if self.candle_start_epoch is not None and self.open is not None:
+                direction = "UP" if self.close > self.open else ("DOWN" if self.close < self.open else "FLAT")
+                log.info(f"M1 candle closed: open={self.open} close={self.close} ({direction})")
                 self.completed.append({
                     "open": self.open, "high": self.high,
                     "low": self.low, "close": self.close,
@@ -387,10 +384,35 @@ async def main():
         SYMBOL, [{"type": "candles", "timeframe": "1m"}, {"type": "candles", "timeframe": "1h"}]
     )
 
+    if TEST_TRADE_ENABLED:
+        log.info("TEST_TRADE_ENABLED is on — firing one no-logic confirmation trade in 5s...")
+        await asyncio.sleep(5)
+        try:
+            price_info = connection.terminal_state.price(SYMBOL)
+            test_price = price_info["bid"] if price_info else None
+        except Exception:
+            test_price = None
+
+        if test_price is None:
+            log.warning("No price available yet for test trade — skipping. Try again once price data is flowing.")
+        else:
+            sl = round(test_price - PATTERN_SL_DISTANCE, 2)
+            tp = round(test_price + PATTERN_TP_DISTANCE, 2)
+            if DRY_RUN:
+                log.info(f"[DRY_RUN] TEST TRADE: would BUY {SYMBOL} at ~{test_price} | SL={sl} TP={tp} | lot={LOT_SIZE}")
+            else:
+                try:
+                    result = await connection.create_market_buy_order(
+                        SYMBOL, volume=LOT_SIZE, stop_loss=sl, take_profit=tp,
+                        options={"comment": "goldflow-test-trade"}
+                    )
+                    log.info(f"TEST TRADE placed: BUY at ~{test_price} SL={sl} TP={tp} | Result: {result}")
+                except Exception as e:
+                    log.error(f"TEST TRADE failed: {e}")
+
     log.info(
         f"goldflow scalper running on {SYMBOL}, DRY_RUN={DRY_RUN}, lot={LOT_SIZE}, "
         f"M1_enabled={SCALP_M1_ENABLED}, H1_enabled={SCALP_H1_ENABLED}, "
-        f"pattern_enabled={PATTERN_STRATEGY_ENABLED}, "
         f"emergency_SL=${EMERGENCY_SL_DISTANCE}, max_daily_loss=${MAX_DAILY_LOSS_USD}"
     )
     while True:
