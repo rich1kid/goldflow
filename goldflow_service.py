@@ -1,24 +1,19 @@
 """
 goldflow_service.py
 
-Late-candle momentum scalper for XAU/USD.
+Late-candle momentum scalper + basic 3-candle pattern confirmation, for XAU/USD.
 
-Strategy (as specified):
-  For both the M1 and H1 timeframes, watch the candle currently forming.
-  In the final 25% of that candle's duration (last 15s of an M1 candle,
-  last 15min of an H1 candle), if volume-so-far is unusually high for
-  how much of the candle has elapsed, enter in the direction of the
-  trend so far (price above/below that candle's open) and close the
-  position automatically right when the candle closes.
+Strategies:
+  1. Scalp (M1/H1): watch the candle currently forming. In its final 25%,
+     if volume-so-far is unusually high, enter in the direction of the
+     trend so far and close automatically when the candle closes.
+  2. Pattern (M1): three consecutive same-direction completed candles
+     with rising/falling closes (a simplified three-soldiers/three-crows
+     check) — fires far more often, used to confirm the execution
+     pipeline actually places trades.
 
 Runs on: Oracle Cloud VPS (systemd service: goldflow.service)
 Talks to: MT5 account via MetaAPI (streaming quotes + trade execution)
-
-NOTE: MetaAPI/MT5 gives the broker's own tick volume, not real
-Depth-of-Market. "Volume-so-far" here is approximated by counting price
-ticks received during the forming candle and comparing to what a
-proportional share of the timeframe's average completed-candle volume
-would predict. It is a heuristic, not real order-book data.
 
 Env vars (.env, never committed):
     METAAPI_TOKEN=your_metaapi_token
@@ -30,6 +25,9 @@ Env vars (.env, never committed):
     MAX_DAILY_LOSS_USD=20.0
     SCALP_M1_ENABLED=true
     SCALP_H1_ENABLED=true
+    PATTERN_STRATEGY_ENABLED=true
+    PATTERN_SL_DISTANCE_USD=3.0
+    PATTERN_TP_DISTANCE_USD=6.0
     DRY_RUN=true
 """
 
@@ -56,19 +54,18 @@ SCALP_VOLUME_MULTIPLIER = float(os.environ.get("SCALP_VOLUME_MULTIPLIER", "1.5")
 MAX_DAILY_LOSS_USD = float(os.environ.get("MAX_DAILY_LOSS_USD", "20.0"))
 SCALP_M1_ENABLED = os.environ.get("SCALP_M1_ENABLED", "true").lower() == "true"
 SCALP_H1_ENABLED = os.environ.get("SCALP_H1_ENABLED", "true").lower() == "true"
+PATTERN_STRATEGY_ENABLED = os.environ.get("PATTERN_STRATEGY_ENABLED", "true").lower() == "true"
+PATTERN_SL_DISTANCE = float(os.environ.get("PATTERN_SL_DISTANCE_USD", "3.0"))
+PATTERN_TP_DISTANCE = float(os.environ.get("PATTERN_TP_DISTANCE_USD", "6.0"))
 
 
 def parse_broker_time(ts: str) -> datetime:
-    """Parses MetaAPI's ISO8601 broker/eventGenerated timestamps."""
     if ts.endswith("Z"):
         ts = ts[:-1] + "+00:00"
     return datetime.fromisoformat(ts)
 
 
 class RiskManager:
-    """Tracks daily equity drawdown and halts new trades if the max daily
-    loss is breached. Resets automatically at the start of a new UTC day."""
-
     def __init__(self, max_daily_loss_usd: float):
         self.max_daily_loss_usd = max_daily_loss_usd
         self.day = None
@@ -100,17 +97,10 @@ class RiskManager:
 
 
 class PartialCandleTracker:
-    """Tracks the candle currently forming for one timeframe, tick by
-    tick, so we can act in its final 25% without waiting for it to close.
-
-    The volume baseline is built from this tracker's OWN completed tick
-    counts (not MetaAPI's candle stream), since MetaAPI sends repeated
-    "intermediate" updates for the still-forming candle."""
-
     def __init__(self, label: str, timeframe_seconds: int, history_len: int = 50):
         self.label = label
         self.timeframe_seconds = timeframe_seconds
-        self.entry_window_seconds = timeframe_seconds * 0.25  # last 25% of the candle
+        self.entry_window_seconds = timeframe_seconds * 0.25
         self.history = deque(maxlen=history_len)
         self.candle_start_epoch = None
         self.open_price = None
@@ -125,7 +115,6 @@ class PartialCandleTracker:
         return sum(self.history) / len(self.history)
 
     def on_tick(self, price: float, ts: datetime):
-        """Returns (seconds_remaining, should_consider_entry: bool)."""
         epoch = ts.timestamp()
         start_epoch = (epoch // self.timeframe_seconds) * self.timeframe_seconds
 
@@ -143,8 +132,6 @@ class PartialCandleTracker:
         elapsed = epoch - start_epoch
         remaining = self.timeframe_seconds - elapsed
 
-        # Mark the moment we cross into the final 25% of the candle, so we
-        # can measure volume RATE from that point forward only.
         if remaining <= self.entry_window_seconds and self.window_start_ticks is None:
             self.window_start_ticks = self.tick_count - 1
             self.window_start_epoch = epoch
@@ -185,8 +172,58 @@ class PartialCandleTracker:
         self.entered_this_candle = True
 
 
+class CandlePatternTracker:
+    def __init__(self, timeframe_seconds: int, history_len: int = 10):
+        self.timeframe_seconds = timeframe_seconds
+        self.candle_start_epoch = None
+        self.open = None
+        self.high = None
+        self.low = None
+        self.close = None
+        self.completed = deque(maxlen=history_len)
+
+    def on_tick(self, price: float, ts: datetime) -> bool:
+        epoch = ts.timestamp()
+        start_epoch = (epoch // self.timeframe_seconds) * self.timeframe_seconds
+        rolled_over = False
+
+        if self.candle_start_epoch != start_epoch:
+            if self.candle_start_epoch is not None and self.open is not None:
+                self.completed.append({
+                    "open": self.open, "high": self.high,
+                    "low": self.low, "close": self.close,
+                })
+                rolled_over = True
+            self.candle_start_epoch = start_epoch
+            self.open = price
+            self.high = price
+            self.low = price
+
+        self.high = max(self.high, price)
+        self.low = min(self.low, price)
+        self.close = price
+        return rolled_over
+
+    def check_pattern(self):
+        if len(self.completed) < 3:
+            return None
+        last3 = list(self.completed)[-3:]
+        bullish = (
+            all(c["close"] > c["open"] for c in last3)
+            and last3[0]["close"] < last3[1]["close"] < last3[2]["close"]
+        )
+        bearish = (
+            all(c["close"] < c["open"] for c in last3)
+            and last3[0]["close"] > last3[1]["close"] > last3[2]["close"]
+        )
+        if bullish:
+            return "buy"
+        elif bearish:
+            return "sell"
+        return None
+
+
 async def close_position_later(connection, position_id: str, delay_seconds: float, label: str):
-    """Waits until the candle closes, then flattens the scalp position."""
     if delay_seconds > 0:
         await asyncio.sleep(delay_seconds)
     if DRY_RUN:
@@ -245,6 +282,41 @@ async def enter_scalp(connection, tracker: PartialCandleTracker, side: str,
         log.error(f"{tracker.label} scalp order failed: {e}")
 
 
+async def enter_pattern_trade(connection, side: str, current_price: float, risk_manager: RiskManager):
+    if not risk_manager.can_trade():
+        log.warning(f"Pattern signal ({side.upper()}) but trading is halted today. Skipping.")
+        return
+
+    if side == "buy":
+        sl = round(current_price - PATTERN_SL_DISTANCE, 2)
+        tp = round(current_price + PATTERN_TP_DISTANCE, 2)
+    else:
+        sl = round(current_price + PATTERN_SL_DISTANCE, 2)
+        tp = round(current_price - PATTERN_TP_DISTANCE, 2)
+
+    if DRY_RUN:
+        log.info(
+            f"[DRY_RUN] Pattern (3 soldiers): would {side.upper()} on {SYMBOL} at ~{current_price} "
+            f"| SL={sl} TP={tp} | lot={LOT_SIZE}"
+        )
+        return
+
+    try:
+        if side == "buy":
+            result = await connection.create_market_buy_order(
+                SYMBOL, volume=LOT_SIZE, stop_loss=sl, take_profit=tp,
+                options={"comment": "goldflow-pattern"}
+            )
+        else:
+            result = await connection.create_market_sell_order(
+                SYMBOL, volume=LOT_SIZE, stop_loss=sl, take_profit=tp,
+                options={"comment": "goldflow-pattern"}
+            )
+        log.info(f"Pattern trade opened: {side.upper()} SL={sl} TP={tp} | Result: {result}")
+    except Exception as e:
+        log.error(f"Pattern trade order failed: {e}")
+
+
 async def main():
     api = MetaApi(METAAPI_TOKEN)
     account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
@@ -260,6 +332,7 @@ async def main():
 
     m1_tracker = PartialCandleTracker("M1", 60)
     h1_tracker = PartialCandleTracker("H1", 3600)
+    pattern_tracker = CandlePatternTracker(60)
     risk_manager = RiskManager(max_daily_loss_usd=MAX_DAILY_LOSS_USD)
 
     try:
@@ -296,6 +369,14 @@ async def main():
                         log.info(f"H1 scalp signal: {direction.upper()} at {mid} ({remaining/60:.1f}min left in candle)")
                         await enter_scalp(connection, h1_tracker, direction, mid, risk_manager)
 
+            if PATTERN_STRATEGY_ENABLED:
+                rolled_over = pattern_tracker.on_tick(mid, ts)
+                if rolled_over:
+                    direction = pattern_tracker.check_pattern()
+                    if direction:
+                        log.info(f"Pattern signal (3 soldiers): {direction.upper()} at {mid}")
+                        await enter_pattern_trade(connection, direction, mid, risk_manager)
+
         async def on_account_information_updated(self, instance_index, account_information):
             equity = account_information.get("equity")
             if equity is not None:
@@ -309,6 +390,7 @@ async def main():
     log.info(
         f"goldflow scalper running on {SYMBOL}, DRY_RUN={DRY_RUN}, lot={LOT_SIZE}, "
         f"M1_enabled={SCALP_M1_ENABLED}, H1_enabled={SCALP_H1_ENABLED}, "
+        f"pattern_enabled={PATTERN_STRATEGY_ENABLED}, "
         f"emergency_SL=${EMERGENCY_SL_DISTANCE}, max_daily_loss=${MAX_DAILY_LOSS_USD}"
     )
     while True:
